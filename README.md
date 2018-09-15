@@ -37,6 +37,8 @@ See [Ad Performance Report](https://developers.google.com/adwords/api/docs/appen
 
 The fields `conversion_value` and `cost` are converted to euro using daily exhange rates from the ECB.
 
+&nbsp;
+
 
 ## Getting started
 
@@ -54,8 +56,6 @@ Then add the pipeline to your ETL with
 
 ```python
 import google_ads_performance_pipeline
-
-# ..
 
 my_pipeline.add(google_ads_performance_pipeline.pipeline)
 ```
