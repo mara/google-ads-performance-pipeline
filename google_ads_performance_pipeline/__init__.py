@@ -3,7 +3,7 @@ from google_ads_performance_pipeline import config
 
 from data_integration.commands.files import ReadFile, Compression
 from data_integration.commands.sql import ExecuteSQL
-from data_integration.parallel_tasks.files import ParallelReadFile, ReadMode
+from data_integration.parallel_tasks.files import ParallelReadFile
 from data_integration.parallel_tasks.sql import ParallelExecuteSQL
 from data_integration.pipelines import Pipeline, Task
 
@@ -21,13 +21,24 @@ pipeline.add_initial(
          ]))
 
 pipeline.add(
-    Task(id="read_campaign_structure",
+    Task(id="read_ad_campaign_structure",
          description="Loads the google ads campaign structure",
          commands=[
-             ExecuteSQL(sql_file_name="create_campaign_structure_data_table.sql", echo_queries=False),
+             ExecuteSQL(sql_file_name="create_ad_campaign_structure_data_table.sql", echo_queries=False),
              ReadFile(file_name="google-ads-account-structure_{}.csv.gz".format(config.input_file_version()),
                       compression=Compression.GZIP, skip_header=True,
-                      target_table="gads_data.campaign_structure",
+                      target_table="gads_data.ad_campaign_structure",
+                      delimiter_char="\t", null_value_string="", csv_format=True)
+         ]))
+
+pipeline.add(
+    Task(id="read_keyword_structure",
+         description="Loads the google keyword campaign structure",
+         commands=[
+             ExecuteSQL(sql_file_name="create_keyword_structure_data_table.sql", echo_queries=False),
+             ReadFile(file_name="google-ads-keyword-account-structure_{}.csv.gz".format(config.input_file_version()),
+                      compression=Compression.GZIP, skip_header=True,
+                      target_table="gads_data.keyword_structure",
                       delimiter_char="\t", null_value_string="", csv_format=True)
          ]))
 
@@ -52,12 +63,48 @@ pipeline.add(
         ]))
 
 pipeline.add(
+    ParallelReadFile(
+        id="read_keyword_performance",
+        description="Loads keyword performance data from json files",
+        file_pattern="*/*/*/google-ads/keywords-performance_{}.json.gz".format(config.input_file_version()),
+        read_mode=config.read_mode(),
+        compression=Compression.GZIP, make_unique=True,
+        mapper_script_file_name="read_keyword_performance.py",
+        target_table="gads_data.keyword_performance_upsert",
+        delimiter_char="\t",
+        date_regex="^(?P<year>\d{4})\/(?P<month>\d{2})\/(?P<day>\d{2})/",
+        file_dependencies=['create_keyword_performance_data_table.sql'],
+        commands_before=[
+            ExecuteSQL(sql_file_name="create_keyword_performance_data_table.sql", echo_queries=False,
+                       file_dependencies=['create_keyword_performance_data_table.sql'])
+        ],
+        commands_after=[
+            ExecuteSQL(sql_statement='SELECT gads_data.upsert_keyword_performance()')
+        ]))
+
+pipeline.add(
+    Task(id="create_device_dimension",
+         description="Creates the device dimension",
+         commands=[
+             ExecuteSQL(sql_file_name="create_device_dimension.sql")
+         ]),
+    upstreams=["read_ad_performance", "read_keyword_performance"])
+
+pipeline.add(
+    Task(id="create_network_type_dimension",
+         description="Creates the network_type dimension",
+         commands=[
+             ExecuteSQL(sql_file_name="create_network_type_dimension.sql")
+         ]),
+    upstreams=["read_ad_performance", "read_keyword_performance"])
+
+pipeline.add(
     Task(id="transform_ad",
          description="Creates the ad dimension table",
          commands=[
              ExecuteSQL(sql_file_name="transform_ad.sql")
          ]),
-    upstreams=["read_campaign_structure", "read_ad_performance"])
+    upstreams=["read_ad_campaign_structure", "read_ad_performance"])
 
 pipeline.add(
     ParallelExecuteSQL(
@@ -69,12 +116,37 @@ pipeline.add(
     upstreams=["transform_ad"])
 
 pipeline.add(
+    Task(id="transform_ad_attribute",
+         description="Creates the ad_attribute and ad_attribute_mapping dimension tables",
+         commands=[
+             ExecuteSQL(sql_file_name="transform_ad_attribute.sql")
+         ]),
+    upstreams=["transform_ad"])
+
+pipeline.add(
+    Task(id="transform_keyword",
+         description="Creates the keyword dimension table",
+         commands=[
+             ExecuteSQL(sql_file_name="transform_keyword.sql")
+         ]),
+    upstreams=["read_keyword_structure", "read_keyword_performance"])
+
+pipeline.add(
+    ParallelExecuteSQL(
+        id="index_keyword",
+        description="Adds indexes to all name columns of the keyword dimension",
+        sql_statement="SELECT util.add_index('gads_dim_next', 'keyword', column_names := ARRAY ['@column@']);",
+        parameter_function=lambda: [('keyword_name',), ('ad_group_name',), ('campaign_name',), ('account_name',)],
+        parameter_placeholders=["@column@"]),
+    upstreams=["transform_keyword"])
+
+pipeline.add(
     Task(id="transform_ad_performance",
          description="Creates the fact table of the google ads performance cube",
          commands=[
-             ExecuteSQL(sql_file_name="transform-ad-performance.sql")
+             ExecuteSQL(sql_file_name="transform_ad_performance.sql")
          ]),
-    upstreams=["read_ad_performance", "read_campaign_structure"])
+    upstreams=["index_ad", "create_device_dimension", "create_network_type_dimension"])
 
 pipeline.add(
     ParallelExecuteSQL(
@@ -86,18 +158,29 @@ pipeline.add(
     upstreams=["transform_ad_performance"])
 
 pipeline.add(
-    Task(id="transform_ad_attribute",
-         description="Creates the ad_attribute and ad_attribute_mapping dimension tables",
+    Task(id="transform_keyword_performance",
+         description="Creates the fact table of the google keywords performance cube",
          commands=[
-             ExecuteSQL(sql_file_name="transform_ad_attribute.sql")
+             ExecuteSQL(sql_file_name="transform_keyword_performance.sql")
          ]),
-    upstreams=["transform_ad"])
+    upstreams=["index_keyword", "create_device_dimension", "create_network_type_dimension"])
+
+pipeline.add(
+    ParallelExecuteSQL(
+        id="index_keyword_performance",
+        description="Adds indexes to all fk columns of the keyword performance fact table",
+        sql_statement="SELECT util.add_index('gads_dim_next', 'keyword_performance',"
+                      "column_names := ARRAY ['@column@']);",
+        parameter_function=lambda: [('day_fk',), ('keyword_fk',), ('network_type_fk',), ('device_fk',)],
+        parameter_placeholders=["@column@"]),
+    upstreams=["transform_keyword_performance"])
 
 pipeline.add_final(
     Task(id="replace_dim_schema",
          description="Replaces the current dim schema with the contents of dim_next",
          commands=[
              ExecuteSQL(sql_statement="SELECT gads_tmp.constrain_ad_performance();"),
+             ExecuteSQL(sql_statement="SELECT gads_tmp.constrain_keyword_performance();"),
              ExecuteSQL(sql_statement="SELECT gads_tmp.constrain_ad_attribute_mapping();"),
              ExecuteSQL(sql_statement="SELECT util.replace_schema('gads_dim', 'gads_dim_next');")
          ]))
